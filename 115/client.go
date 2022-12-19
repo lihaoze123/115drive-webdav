@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httputil"
 	"net/url"
 	"path"
@@ -15,58 +14,61 @@ import (
 	"github.com/bluele/gcache"
 	"github.com/gaoyb7/115drive-webdav/common"
 	"github.com/gaoyb7/115drive-webdav/common/drive"
+	"github.com/go-resty/resty/v2"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 
-var (
-	defaultClient *DriveClient
-)
-
 type DriveClient struct {
-	HttpClient   *http.Client
-	cookieJar    *cookiejar.Jar
+	HttpClient   *resty.Client
 	cache        gcache.Cache
 	reserveProxy *httputil.ReverseProxy
 	limiter      *rate.Limiter
 }
 
-func Get115DriveClient() drive.DriveClient {
-	return defaultClient
-}
+func MustNew115DriveClient(uid string, cid string, seid string) *DriveClient {
+	httpClient := resty.New().SetCookie(&http.Cookie{
+		Name:     "UID",
+		Value:    uid,
+		Domain:   "www.115.com",
+		Path:     "/",
+		HttpOnly: true,
+	}).SetCookie(&http.Cookie{
+		Name:     "CID",
+		Value:    cid,
+		Domain:   "www.115.com",
+		Path:     "/",
+		HttpOnly: true,
+	}).SetCookie(&http.Cookie{
+		Name:     "SEID",
+		Value:    seid,
+		Domain:   "www.115.com",
+		Path:     "/",
+		HttpOnly: true,
+	}).SetHeader("User-Agent", UserAgent)
 
-func MustInit115DriveClient(uid string, cid string, seid string) {
-	cookieJar, err := cookiejar.New(nil)
-	if err != nil {
-		panic(err)
-	}
-
-	defaultClient = &DriveClient{
-		HttpClient: &http.Client{Jar: cookieJar},
-		cookieJar:  cookieJar,
+	client := &DriveClient{
+		HttpClient: httpClient,
 		cache:      gcache.New(10000).LFU().Build(),
-		limiter:    rate.NewLimiter(5, 10),
-	}
-	defaultClient.reserveProxy = &httputil.ReverseProxy{
-		Transport: defaultClient.HttpClient.Transport,
-		Director: func(req *http.Request) {
-			req.Header.Set("Referer", "https://115.com/")
-			req.Header.Set("User-Agent", UserAgent)
-			req.Header.Set("Host", req.Host)
+		limiter:    rate.NewLimiter(5, 1),
+		reserveProxy: &httputil.ReverseProxy{
+			Transport: httpClient.GetClient().Transport,
+			Director: func(req *http.Request) {
+				req.Header.Set("Referer", "https://115.com/")
+				req.Header.Set("User-Agent", UserAgent)
+				req.Header.Set("Host", req.Host)
+			},
 		},
 	}
 
-	defaultClient.ImportCredential(uid, cid, seid)
-
 	// login check
-	userID, err := APILoginCheck(defaultClient.HttpClient)
-	if err != nil {
-		panic(err)
-	}
-	if userID <= 0 {
-		panic("115 drive login fail")
+	userID, err := APILoginCheck(client.HttpClient)
+	if err != nil || userID <= 0 {
+		logrus.WithError(err).Panicf("115 drive login fail")
 	}
 	logrus.Infof("115 drive login succ, user_id: %d", userID)
+
+	return client
 }
 
 func (c *DriveClient) GetFiles(dir string) ([]drive.File, error) {
@@ -130,6 +132,19 @@ func (c *DriveClient) GetFile(filePath string) (drive.File, error) {
 	return nil, common.ErrNotFound
 }
 
+func (c *DriveClient) ServeContent(w http.ResponseWriter, req *http.Request, fi drive.File) {
+	fileURL, err := c.GetFileURL(fi)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+		return
+	}
+
+	logrus.Infof("proxy open [name: %v] [url: %v] [range: %v]", fi.GetName(), fileURL, req.Header.Get("Range"))
+	req.Header.Del("If-Match")
+	c.Proxy(w, req, fileURL)
+}
+
 func (c *DriveClient) GetFileURL(file drive.File) (string, error) {
 	pickCode := file.(*FileInfo).PickCode
 	cacheKey := fmt.Sprintf("url:%s", pickCode)
@@ -137,6 +152,7 @@ func (c *DriveClient) GetFileURL(file drive.File) (string, error) {
 		return value.(string), nil
 	}
 
+	c.limiter.Wait(context.Background())
 	info, err := APIGetDownloadURL(c.HttpClient, pickCode)
 	if err != nil {
 		return "", err
@@ -150,6 +166,7 @@ func (c *DriveClient) GetFileURL(file drive.File) (string, error) {
 }
 
 func (c *DriveClient) RemoveFile(filePath string) error {
+	c.limiter.Wait(context.Background())
 	fi, err := c.GetFile(filePath)
 	if err != nil {
 		return err
@@ -181,9 +198,45 @@ func (c *DriveClient) RemoveFile(filePath string) error {
 	return nil
 }
 
+func (c *DriveClient) MakeDir(dir string) error {
+	c.limiter.Wait(context.Background())
+	getDirIDResp, err := APIGetDirID(c.HttpClient, dir)
+	if err != nil {
+		return err
+	}
+	cid, _ := getDirIDResp.CategoryID.Int64()
+	if cid != 0 {
+		logrus.WithField("dir", dir).Infof("dir exists, ignore")
+		return nil
+	}
+
+	dir = slashClean(dir)
+	parentDir, name := path.Split(dir)
+	getDirIDResp, err = APIGetDirID(c.HttpClient, parentDir)
+	if err != nil {
+		return err
+	}
+
+	pid := getDirIDResp.CategoryID.String()
+	if pid == "0" && parentDir != "/" {
+		return nil
+	}
+	resp, err := APIAddDir(c.HttpClient, pid, name)
+	if err != nil {
+		return err
+	}
+	if !resp.State {
+		return fmt.Errorf("new dir fail, state is false")
+	}
+
+	c.flushDir(parentDir)
+	return nil
+}
+
 func (c *DriveClient) MoveFile(srcPath string, dstPath string) error {
 	logrus.Infof("move file, src: %s, dst: %s", srcPath, dstPath)
 
+	c.limiter.Wait(context.Background())
 	fi, err := c.GetFile(srcPath)
 	if err != nil {
 		return err
@@ -252,6 +305,7 @@ func (c *DriveClient) Proxy(w http.ResponseWriter, req *http.Request, targetURL 
 		if err := recover(); err != nil {
 			if realErr, ok := err.(error); ok {
 				if errors.Is(realErr, http.ErrAbortHandler) {
+					logrus.WithError(realErr).Warnf("proxy abort error")
 					return
 				}
 			}
@@ -263,17 +317,8 @@ func (c *DriveClient) Proxy(w http.ResponseWriter, req *http.Request, targetURL 
 	u, _ := url.Parse(targetURL)
 	req.URL = u
 	req.Host = u.Host
+	c.limiter.Wait(context.Background())
 	c.reserveProxy.ServeHTTP(w, req)
-}
-
-func (c *DriveClient) ImportCredential(uid string, cid string, seid string) {
-	cookies := map[string]string{
-		"UID":  uid,
-		"CID":  cid,
-		"SEID": seid,
-	}
-	c.importCookies(CookieDomain115, "/", cookies)
-	c.importCookies(CookieDomainAnxia, "/", cookies)
 }
 
 func (c *DriveClient) flushDir(dir string) {
@@ -283,30 +328,6 @@ func (c *DriveClient) flushDir(dir string) {
 		dir = "/"
 	}
 	c.cache.Remove(fmt.Sprintf("files:%s", dir))
-}
-
-func (c *DriveClient) importCookies(domain string, path string, cookies map[string]string) {
-	url := &url.URL{
-		Scheme: "https",
-		Path:   "/",
-	}
-	if domain[0] == '.' {
-		url.Host = "www" + domain
-	} else {
-		url.Host = domain
-	}
-	cks := make([]*http.Cookie, 0)
-	for name, value := range cookies {
-		cookie := &http.Cookie{
-			Name:     name,
-			Value:    value,
-			Domain:   domain,
-			Path:     path,
-			HttpOnly: true,
-		}
-		cks = append(cks, cookie)
-	}
-	c.cookieJar.SetCookies(url, cks)
 }
 
 func slashClean(name string) string {

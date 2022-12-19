@@ -53,7 +53,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "PUT":
 		status, err = http.StatusMethodNotAllowed, errUnsupportedMethod
 	case "MKCOL":
-		status, err = http.StatusMethodNotAllowed, errUnsupportedMethod
+		status, err = h.handleMkcol(w, r)
 	case "MOVE":
 		status, err = h.handleMove(w, r)
 	case "LOCK":
@@ -124,14 +124,9 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
-
-	fileURL, err := h.DriveClient.GetFileURL(fi)
-	if err != nil {
-		logrus.WithError(err).Errorf("handleGetHeadPost, call h.DriveClient.GetURL fail")
-		return http.StatusInternalServerError, err
-	}
 	w.Header().Set("ETag", etag)
-	h.DriveClient.Proxy(w, r, fileURL)
+
+	h.DriveClient.ServeContent(w, r, fi)
 	return 0, nil
 }
 
@@ -158,6 +153,29 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 		return http.StatusMethodNotAllowed, err
 	}
 	return http.StatusNoContent, nil
+}
+
+func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status int, err error) {
+	reqPath, status, err := h.stripPrefix(r.URL.Path)
+	if err != nil {
+		return status, err
+	}
+	release, status, err := h.confirmLocks(r, reqPath, "")
+	if err != nil {
+		return status, err
+	}
+	defer release()
+
+	if r.ContentLength > 0 {
+		return http.StatusUnsupportedMediaType, nil
+	}
+	if err := h.DriveClient.MakeDir(reqPath); err != nil {
+		if errors.Is(err, common.ErrNotFound) {
+			return http.StatusNotFound, err
+		}
+		return http.StatusMethodNotAllowed, err
+	}
+	return http.StatusCreated, nil
 }
 
 func (h *Handler) handleMove(w http.ResponseWriter, r *http.Request) (status int, err error) {
